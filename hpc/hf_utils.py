@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import re
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 # Default HuggingFace org for auto-derived repo IDs (override with env var)
 DEFAULT_HF_ORG = "DCAgent"
 HF_ORG_ENV_VAR = "DCAGENT_HF_ORG"
+DAYTONA_DATA_COPY_MARKER = "# ot-agent: expanded environment/data COPY for Daytona source build"
 
 
 def is_hf_dataset_path(path: str) -> bool:
@@ -128,8 +133,6 @@ def resolve_dataset_path(
     Returns:
         Resolved local filesystem path (absolute)
     """
-    from pathlib import Path
-
     if is_hf_dataset_path(path_or_repo):
         # It's an HF dataset identifier - download it
         from huggingface_hub import snapshot_download
@@ -146,6 +149,102 @@ def resolve_dataset_path(
 
         resolved = resolve_repo_path(path_or_repo)
         return str(resolved)
+
+
+def _environment_data_copy_replacement(dockerfile: Path, line: str) -> list[str] | None:
+    match = re.match(r"^\s*COPY\s+(?:\./)?data/?(?:\s+)(\S+)\s*$", line, re.IGNORECASE)
+    if not match:
+        return None
+    data_root = dockerfile.parent / "data"
+    if not data_root.is_dir():
+        return None
+    files = sorted(path for path in data_root.rglob("*") if path.is_file())
+    if not files:
+        return None
+
+    destination_root = match.group(1).rstrip("/") or "."
+    mkdirs = {destination_root}
+    copy_lines: list[str] = []
+    for file_path in files:
+        relative_path = file_path.relative_to(data_root).as_posix()
+        destination_path = (
+            relative_path
+            if destination_root == "."
+            else posixpath.join(destination_root, relative_path)
+        )
+        parent = posixpath.dirname(destination_path)
+        if parent and parent != ".":
+            mkdirs.add(parent)
+        copy_lines.append(f"COPY data/{relative_path} {destination_path}")
+
+    mkdir_args = " ".join(sorted(mkdirs))
+    return [DAYTONA_DATA_COPY_MARKER, f"RUN mkdir -p {mkdir_args}", *copy_lines]
+
+
+def _has_environment_data_copy(dockerfile: Path) -> bool:
+    if not dockerfile.exists():
+        return False
+    data_root = dockerfile.parent / "data"
+    if not data_root.is_dir():
+        return False
+    return any(
+        re.match(r"^\s*COPY\s+(?:\./)?data/?(?:\s+)\S+\s*$", line, re.IGNORECASE)
+        for line in dockerfile.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def needs_daytona_source_staging(tasks_dir: str | Path) -> bool:
+    """Return whether HF raw tasks need staging before Daytona source build."""
+    root = Path(tasks_dir)
+    if any(path.is_symlink() for path in root.rglob("*")):
+        return True
+    return any(
+        _has_environment_data_copy(task_dir / "environment" / "Dockerfile")
+        for task_dir in root.iterdir()
+        if task_dir.is_dir()
+    )
+
+
+def _expand_environment_data_copies_for_daytona(tasks_dir: Path) -> int:
+    """Avoid Daytona's fragile directory-context upload path for task data."""
+    rewritten = 0
+    for task_dir in sorted(path for path in tasks_dir.iterdir() if path.is_dir()):
+        dockerfile = task_dir / "environment" / "Dockerfile"
+        if not dockerfile.exists() or dockerfile.is_symlink():
+            continue
+        original_lines = dockerfile.read_text(encoding="utf-8").splitlines()
+        new_lines: list[str] = []
+        changed = False
+        for line in original_lines:
+            replacement = _environment_data_copy_replacement(dockerfile, line)
+            if replacement is None:
+                new_lines.append(line)
+            else:
+                new_lines.extend(replacement)
+                changed = True
+        if changed:
+            dockerfile.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            rewritten += 1
+    return rewritten
+
+
+def materialize_raw_tasks_for_daytona_source_build(
+    source_path: str | Path,
+    *,
+    verbose: bool = True,
+) -> str:
+    """Stage HF raw tasks as real files before Harbor/Daytona source builds."""
+    source = Path(source_path).expanduser().resolve()
+    staged = Path(tempfile.mkdtemp(prefix="ot-agent-hf-tasks-"))
+    shutil.copytree(source, staged, symlinks=False, dirs_exist_ok=True)
+    data_copy_rewrites = _expand_environment_data_copies_for_daytona(staged)
+
+    if verbose:
+        print(
+            "[hf_utils] Staged HF raw tasks for Daytona source build: "
+            f"{source} -> {staged} ({data_copy_rewrites} data COPY lines expanded)"
+        )
+    return str(staged)
 
 
 def is_raw_tasks_directory(snapshot_dir) -> bool:
@@ -227,6 +326,8 @@ __all__ = [
     "HF_ORG_ENV_VAR",
     "is_hf_dataset_path",
     "is_raw_tasks_directory",
+    "materialize_raw_tasks_for_daytona_source_build",
+    "needs_daytona_source_staging",
     "sanitize_hf_repo_id",
     "derive_default_hf_repo_id",
     "resolve_dataset_path",

@@ -16,7 +16,15 @@ from typing import Optional, Tuple
 from hpc.launch_utils import PROJECT_ROOT
 from hpc.local_runner_utils import LocalHarborRunner
 from hpc.arg_groups import add_harbor_env_arg, add_hf_upload_args, add_database_upload_args
-from hpc.hf_utils import resolve_hf_repo_id
+from hpc.hf_utils import (
+    is_hf_dataset_path,
+    is_raw_tasks_directory,
+    materialize_raw_tasks_for_daytona_source_build,
+    needs_daytona_source_staging,
+    resolve_dataset_path,
+    resolve_hf_repo_id,
+)
+from hpc.launch_utils import convert_parquet_to_tasks
 
 
 class EvalRunner(LocalHarborRunner):
@@ -97,14 +105,19 @@ class EvalRunner(LocalHarborRunner):
 
         # Resolve dataset path if provided (handles both local paths and HF repo IDs)
         if self.args.dataset_path:
-            from hpc.hf_utils import resolve_dataset_path, is_raw_tasks_directory
-            from hpc.launch_utils import convert_parquet_to_tasks
-
             original_identifier = self.args.dataset_path
             self.args.dataset_path = resolve_dataset_path(self.args.dataset_path, verbose=True)
 
             # Auto-detect parquet datasets and convert to task directories
-            if not is_raw_tasks_directory(self.args.dataset_path):
+            if is_raw_tasks_directory(self.args.dataset_path):
+                if is_hf_dataset_path(original_identifier) and needs_daytona_source_staging(
+                    self.args.dataset_path
+                ):
+                    self.args.dataset_path = materialize_raw_tasks_for_daytona_source_build(
+                        self.args.dataset_path,
+                        verbose=True,
+                    )
+            else:
                 self.args.dataset_path = convert_parquet_to_tasks(
                     self.args.dataset_path, original_identifier
                 )
